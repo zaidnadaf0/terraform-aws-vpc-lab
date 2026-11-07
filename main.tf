@@ -1,5 +1,23 @@
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
 provider "aws" {
   region = var.aws_region
+
+  default_tags {
+    tags = {
+      Project   = var.project_name
+      ManagedBy = "terraform"
+    }
+  }
 }
 
 # --- VPC ---
@@ -53,6 +71,8 @@ resource "aws_eip" "nat" {
   tags = {
     Name = "${var.project_name}-nat-eip"
   }
+
+  depends_on = [aws_internet_gateway.gw]
 }
 
 # --- NAT Gateway ---
@@ -106,27 +126,31 @@ resource "aws_route_table_association" "private" {
 }
 
 # --- Security Group ---
+# The web server lives in the private subnet, so its rules are scoped to the
+# VPC by default. Widen allowed_ssh_cidr / allowed_http_cidr only on purpose.
 resource "aws_security_group" "web" {
   name_prefix = "${var.project_name}-web-sg"
+  description = "HTTP and SSH for the private web server, scoped to the VPC by default"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "HTTP"
+    description = "HTTP from inside the VPC"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.allowed_http_cidr]
   }
 
   ingress {
-    description = "SSH"
+    description = "SSH from inside the VPC"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.allowed_ssh_cidr]
   }
 
   egress {
+    description = "All outbound traffic"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -136,6 +160,38 @@ resource "aws_security_group" "web" {
   tags = {
     Name = "${var.project_name}-web-sg"
   }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# --- SSM access without a bastion or public IP ---
+data "aws_iam_policy_document" "ec2_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ssm" {
+  name               = "${var.project_name}-ssm-role"
+  description        = "Allows Session Manager access to the private web server"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ssm.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ssm" {
+  name = "${var.project_name}-ssm-profile"
+  role = aws_iam_role.ssm.name
 }
 
 # --- EC2 Instance ---
@@ -154,14 +210,16 @@ resource "aws_instance" "web" {
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.private.id
   vpc_security_group_ids = [aws_security_group.web.id]
+  iam_instance_profile   = aws_iam_instance_profile.ssm.name
 
   user_data = <<-EOF
               #!/bin/bash
+              set -euo pipefail
               yum update -y
               yum install -y httpd
-              systemctl start httpd
               systemctl enable httpd
-              echo "<h1>Hello from RoadAssist VPC Lab</h1>" > /var/www/html/index.html
+              systemctl start httpd
+              echo "<h1>Hello from the Terraform VPC Lab</h1>" > /var/www/html/index.html
               EOF
 
   tags = {
